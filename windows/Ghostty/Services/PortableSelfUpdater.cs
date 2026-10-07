@@ -46,7 +46,7 @@ namespace Ghostty.Services;
 internal static class PortableSelfUpdater
 {
     /// <summary>The repository whose Releases feed the updater.</summary>
-    public const string Repository = "deblasis/wintty";
+    public const string Repository = "sergiosanchezjnr/wintty-builder";
 
     /// <summary>Name the packaging workflow must give the portable asset.</summary>
     public const string PortableAssetName = "wintty-portable-win-x64.zip";
