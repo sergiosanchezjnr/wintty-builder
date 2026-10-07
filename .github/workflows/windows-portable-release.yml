@@ -172,7 +172,13 @@ jobs:
         run: |
           $pub = Join-Path $env:RUNNER_TEMP 'publish'
           $zip = Join-Path $env:RUNNER_TEMP 'wintty-portable-win-x64.zip'
-          Compress-Archive -Path (Join-Path $pub '*') -DestinationPath $zip -CompressionLevel Optimal
+          # Wrap everything in a top-level "Wintty" folder so unzipping yields
+          # Wintty/Wintty.exe instead of scattering files into the current dir.
+          $stage = Join-Path $env:RUNNER_TEMP 'zipstage\Wintty'
+          if (Test-Path (Split-Path $stage)) { Remove-Item (Split-Path $stage) -Recurse -Force }
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          Copy-Item -Path (Join-Path $pub '*') -Destination $stage -Recurse -Force
+          Compress-Archive -Path $stage -DestinationPath $zip -CompressionLevel Optimal
           $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
           "$hash  wintty-portable-win-x64.zip" | Set-Content -Encoding ascii "$zip.sha256"
           "size: {0:N1} MB" -f ((Get-Item $zip).Length / 1MB)
