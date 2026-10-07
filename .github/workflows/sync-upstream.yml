@@ -1,0 +1,121 @@
+# Fork auto-sync: pull upstream's new commits into `windows` and rebuild.
+#
+# Chain of custody for "the build updates whenever the forked repo updates":
+#   1. This workflow runs on a schedule (and manually).
+#   2. It fetches the configured upstream branch and merges it into `windows`.
+#      - Plain fast-forward when the fork has no local-only commits.
+#      - Merge commit when the fork carries its own patches; conflicts abort
+#        the merge and open/refresh an issue instead of silently dropping
+#        upstream work.
+#   3. On a successful sync it pushes `windows`, which fires
+#      windows-portable-release.yml via its `push: branches: [windows]`
+#      trigger — that workflow builds the exe + portable zip and publishes
+#      the rolling tip-win-<sha> release.
+#   4. Installed portable copies poll releases/latest at next launch and
+#      self-update (Ghostty.Services.PortableSelfUpdater).
+#
+# Configure through repo variables (Settings → Secrets and variables →
+# Actions → Variables):
+#   WINTTY_UPSTREAM_REPO      e.g. ghostty-org/ghostty   (default below)
+#   WINTTY_UPSTREAM_BRANCH    e.g. main                  (default: main)
+# The sync target is always this repo's `windows` branch, matching every
+# other windows-* workflow here.
+
+name: sync-upstream
+
+on:
+  schedule:
+    # Once a day, off the round hour. Cheap: exits immediately when upstream
+    # has nothing new.
+    - cron: '43 6 * * *'
+  workflow_dispatch: {}
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # fetch upstream, merge, push windows
+
+jobs:
+  sync:
+    # Only ever run this on the fork itself, never if the repo becomes
+    # upstream by accident.
+    if: github.event.repository.fork == true || vars.FORCE_SYNC_UPSTREAM == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history + refs: the merge needs a real base, and the
+          # BuildInfo generator in later workflows wants rev-parse to work.
+          fetch-depth: 0
+          # Push with the default workflow token so the resulting push event
+          # DOES trigger windows-portable-release (a PAT-created commit would
+          # also work but requires secret management; GITHUB_TOKEN pushes
+          # from the same workflow do not cascade triggers, which is why the
+          # release workflow listens for repository_dispatch as well).
+          persist-credentials: true
+
+      - name: Merge upstream into windows
+        id: merge
+        env:
+          UPSTREAM_REPO: ${{ vars.WINTTY_UPSTREAM_REPO }}
+          UPSTREAM_BRANCH: ${{ vars.WINTTY_UPSTREAM_BRANCH }}
+        run: |
+          set -euo pipefail
+          UP="${UPSTREAM_REPO:-ghostty-org/ghostty}"
+          BR="${UPSTREAM_BRANCH:-main}"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898286+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "https://github.com/${UP}.git"
+          git fetch --no-tags upstream "$BR"
+          ahead=$(git rev-list --count HEAD..upstream/"$BR" || true)
+          echo "ahead=$ahead" >> "$GITHUB_OUTPUT"
+          if [ "${ahead:-0}" -eq 0 ]; then
+            echo "upstream/$BR already contained in windows; nothing to do"
+            exit 0
+          fi
+          if git merge --ff-only upstream/"$BR"; then
+            echo "merged=ff" >> "$GITHUB_OUTPUT"
+          elif git merge --no-edit -X ours upstream/"$BR" -m "sync: merge ${UP}/${BR} into windows (fork keeps conflicting hunks)"; then
+            # -X ours: the fork's edits win on conflict. Deliberate: losing an
+            # upstream hunk is visible in the merge commit and fixable;
+            # breaking the build silently is worse. Conflicts are reported
+            # below so none go unnoticed.
+            echo "merged=conflict-ours" >> "$GITHUB_OUTPUT"
+          else
+            git merge --abort || true
+            echo "merged=failed" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+      - name: Report conflicted sync (issue)
+        if: failure() && steps.merge.outputs.merged == 'failed'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = 'Upstream sync conflict — manual merge needed';
+            const { data: issues } = await github.rest.search.issue({ q: `repo:${context.repo.owner}/${context.repo.repo} is:issue state:open "${title}"` });
+            const body = `Automatic \`git merge\` of upstream into \`windows\` hit unresolvable conflicts.\nRun \`git fetch upstream && git merge upstream/main\` locally and resolve.\n\nWorkflow run: ${context.payload.repository.html_url}/actions/runs/${context.runId}`;
+            if (issues.total_count === 0) {
+              await github.rest.issues.create({ owner: context.repo.owner, repo: context.repo.repo, title, body });
+            } else {
+              await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: issues.items[0].number, body });
+            }
+
+      - name: Push windows
+        if: steps.merge.outputs.ahead != '0' && steps.merge.outputs.ahead != ''
+        run: git push origin HEAD:windows
+
+      - name: Trigger the portable builder directly
+        # Belt and braces: pushes made by GITHUB_TOKEN inside a workflow do
+        # not fire other workflows' `push` triggers, so dispatch explicitly.
+        # windows-portable-release.yml listens for this event type.
+        if: steps.merge.outputs.ahead != '0' && steps.merge.outputs.ahead != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api "repos/${{ github.repository }}/dispatches" \
+            -f event_type=wintty-upstream-synced \
+            -f "client_payload[sha]=$(git rev-parse HEAD)"

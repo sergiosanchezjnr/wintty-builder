@@ -1,0 +1,251 @@
+# Automated Windows portable builder for the fork.
+#
+# Produces, on every tracked change:
+#   - wintty-portable-win-x64.zip  — unpack anywhere, double-click Wintty.exe,
+#     it just works: NativeAOT self-contained exe (no .NET install needed),
+#     native/ghostty.dll, share/ resources, licenses, and a wintty-build.json
+#     identity sidecar the in-app updater reads at runtime.
+#   - wintty-portable-win-x64.zip.sha256 — checksum sidecar the updater verifies.
+#
+# Both are attached to a rolling prerelease tagged tip-win-<short-sha>, which
+# is what Ghostty.Services.PortableSelfUpdater polls via
+# "releases/latest" (the tag/body carry the commit hash — that IS the version,
+# since every tip build is 0.0.0).
+#
+# Triggers:
+#   - push to `windows` (this repo's own development)
+#   - repository_dispatch `wintty-upstream-synced` (sent by sync-upstream.yml
+#     after a fork sync, or by any external hook after a cherry-pick merge)
+#   - schedule + workflow_dispatch (belt and braces: catches missed events)
+#
+# Requirements on the repo:
+#   - default branch must NOT be `windows` (GitHub refuses to attach assets to
+#     a release whose tag equals the default branch);
+#   - Actions → General → Workflow permissions: "Read and write" (or keep the
+#     contents: write below and leave fine-grained tokens enabled).
+
+name: windows-portable-release
+
+on:
+  push:
+    branches: [windows]
+  repository_dispatch:
+    types: [wintty-upstream-synced]
+  schedule:
+    # Twice a day; the no-change guard below makes an unchanged rebuild free.
+    - cron: '17 3,15 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Publish even if the artifact inputs are unchanged since the last run'
+        type: boolean
+        required: false
+        default: true
+
+concurrency:
+  group: windows-portable-release
+  cancel-in-progress: false  # never abort mid-publish; serialize instead
+
+permissions:
+  contents: write   # create the tag/release
+  actions: write    # read previous run artifacts for the no-change guard
+
+env:
+  DOTNET_NOLOGO: 'true'
+  DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    outputs:
+      skip: ${{ steps.guard.outputs.skip }}
+      short_sha: ${{ steps.info.outputs.short_sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0   # BuildInfo.g.cs bakes git rev-parse; full history keeps it honest
+
+      - name: Collect build info
+        id: info
+        shell: pwsh
+        run: |
+          $sha  = git rev-parse HEAD
+          $short = git rev-parse --short HEAD
+          "sha=$sha" >> $env:GITHUB_OUTPUT
+          "short_sha=$short" >> $env:GITHUB_OUTPUT
+
+      # No-change guard: scheduled/dispatch triggers skip the (expensive) build
+      # when the zip-relevant inputs are byte-identical to the last successful
+      # publish of this same commit set. Explicit pushes and forced dispatches
+      # always build.
+      - name: Detect artifact changes since last successful run
+        id: guard
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        with:
+          predicate-quantifier: 'every'
+          filters: |
+            artifact:
+              - '**'
+              - '!.github/**'
+              - '!*.md'
+              - '!docs/**'
+              - '!example/**'
+              - '!test/**'
+              - '!img/**'
+              - '!*.txt'
+              - '!LICENSE'
+
+      - name: Decide
+        id: decide
+        shell: pwsh
+        run: |
+          $manual = '${{ github.event_name }}' -eq 'workflow_dispatch'
+          $force  = ('${{ github.event.inputs.force }}' -eq 'true')
+          $push   = '${{ github.event_name }}' -eq 'push'
+          $changed = ('${{ steps.guard.outputs.artifact }}' -eq 'true')
+          $skip = (-not $manual) -and (-not $force) -and (-not $push) -and (-not $changed)
+          "skip=$($skip ? 'true' : 'false')" >> $env:GITHUB_OUTPUT
+          if ($skip) { 'No artifact-relevant changes since base; skipping build.' }
+
+      # Same pinned actions and same recipe as windows-tests.yml / the justfile
+      # release lanes: zig builds libghostty (ReleaseFast, app-runtime=none),
+      # then the unpackaged WinUI app publishes as a NativeAOT self-contained
+      # win-x64 single folder.
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        if: steps.decide.outputs.skip != 'true'
+
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        if: steps.decide.outputs.skip != 'true'
+
+      - name: Build ghostty.dll (zig core)
+        if: steps.decide.outputs.skip != 'true'
+        run: zig build -Dapp-runtime=none -Doptimize=ReleaseFast
+
+      - name: Restore (locked)
+        if: steps.decide.outputs.skip != 'true'
+        run: dotnet restore windows/Ghostty.sln /p:RestoreLockedMode=true
+
+      - name: Publish portable app (NativeAOT, self-contained)
+        if: steps.decide.outputs.skip != 'true'
+        shell: pwsh
+        run: >
+          dotnet publish windows/Ghostty/Ghostty.csproj
+          -c Release -r win-x64 /p:Platform=x64 --self-contained true
+          /p:RestoreLockedMode=true
+          -o "${env:RUNNER_TEMP}\publish"
+
+      - name: Assemble portable payload
+        if: steps.decide.outputs.skip != 'true'
+        shell: pwsh
+        run: |
+          $pub = Join-Path $env:RUNNER_TEMP 'publish'
+          if (-not (Test-Path (Join-Path $pub 'Wintty.exe'))) {
+            throw 'Wintty.exe missing from publish output'
+          }
+          # Hard gates: the pieces that make double-click work. Fail loudly
+          # here rather than shipping a zip that opens an error dialog.
+          $required = @(
+            'native\ghostty.dll',
+            'share\terminfo\ghostty.terminfo',
+            'Microsoft.WindowsAppRuntime.Insights.Resource.dll'  # #1086: toasts die without it
+          )
+          foreach ($r in $required) {
+            if (-not (Test-Path (Join-Path $pub $r))) {
+              throw "portable payload incomplete: missing $r"
+            }
+          }
+          # Release packaging sweeps debug symbols out of the shipped tree
+          # (Ghostty.csproj documents this).
+          Get-ChildItem $pub -Recurse -Filter *.pdb | Remove-Item -Force
+
+          # Identity sidecar: the in-app updater (BuildIdentity.ReadCommit)
+          # compares this against releases/latest to decide "am I old?".
+          $short = '${{ steps.info.outputs.short_sha }}'
+          @{ commit = $short; version = "0.0.0-tip+$short" } |
+            ConvertTo-Json -Compress |
+            Set-Content -Encoding utf8NoBOM (Join-Path $pub 'wintty-build.json')
+
+      - name: Zip + checksum
+        if: steps.decide.outputs.skip != 'true'
+        shell: pwsh
+        run: |
+          $pub = Join-Path $env:RUNNER_TEMP 'publish'
+          $zip = Join-Path $env:RUNNER_TEMP 'wintty-portable-win-x64.zip'
+          # Wrap everything in a top-level "Wintty" folder so unzipping yields
+          # Wintty/Wintty.exe instead of scattering files into the current dir.
+          $stage = Join-Path $env:RUNNER_TEMP 'zipstage\Wintty'
+          if (Test-Path (Split-Path $stage)) { Remove-Item (Split-Path $stage) -Recurse -Force }
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          Copy-Item -Path (Join-Path $pub '*') -Destination $stage -Recurse -Force
+          Compress-Archive -Path $stage -DestinationPath $zip -CompressionLevel Optimal
+          $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
+          "$hash  wintty-portable-win-x64.zip" | Set-Content -Encoding ascii "$zip.sha256"
+          "size: {0:N1} MB" -f ((Get-Item $zip).Length / 1MB)
+
+      - name: Stage release files
+        if: steps.decide.outputs.skip != 'true'
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'assets'
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Copy-Item (Join-Path $env:RUNNER_TEMP 'wintty-portable-win-x64.zip') $dir
+          Copy-Item (Join-Path $env:RUNNER_TEMP 'wintty-portable-win-x64.zip.sha256') $dir
+          # Stale marker cleanup safety net: if a previous attempt left one,
+          # re-upload idempotently instead of failing.
+          "ASSETS_DIR=$dir" >> $env:GITHUB_ENV
+
+      # Publish via gh: idempotent (create-or-clobber), and the only step that
+      # both creates the tag and attaches the assets. A previous run's leftover
+      # release/tag for the same commit is overwritten, never a hard error.
+      - name: Create/update GitHub release (rolling tip)
+        if: steps.decide.outputs.skip != 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag  = 'tip-win-${{ steps.info.outputs.short_sha }}'
+          $dir  = $env:ASSETS_DIR
+          $zip  = Join-Path $dir 'wintty-portable-win-x64.zip'
+          $sha  = Join-Path $dir 'wintty-portable-win-x64.zip.sha256'
+          $body = "Automated Windows portable build of commit ${{ steps.info.outputs.sha }}.`n`nCommit: ${{ steps.info.outputs.short_sha }}`nBranch: windows`n`nDownload wintty-portable-win-x64.zip, extract to any folder, double-click Wintty.exe. Self-contained: nothing to install. Installed portable builds update themselves from this release feed."
+          if (gh release view $tag 2>$null) {
+            gh release upload $tag $zip $sha --clobber
+            gh release edit $tag --prerelease --title "Wintty tip win-x64 ($tag)" --notes $body
+          } else {
+            gh release create $tag $zip $sha --prerelease --target-name '${{ github.ref_name }}' --title "Wintty tip win-x64 ($tag)" --notes $body
+          }
+          # Sanity gate: the asset names the in-app updater looks for must exist.
+          $names = gh release view $tag --json assets --jq '.assets[].name'
+          if ($names -notcontains 'wintty-portable-win-x64.zip') {
+            throw 'release lacks wintty-portable-win-x64.zip — updater would find NoAsset'
+          }
+          "Published https://github.com/${{ github.repository }}/releases/tag/$tag"
+
+  # Housekeeping: keep the newest 10 tip-win releases so the Releases page and
+  # storage stay tidy. The updater polls /releases/latest, which excludes
+  # drafts but includes prereleases — and GitHub orders "latest" by semver-ish
+  # tag name, falling back to creation time when tags aren't semver. tip-win-*
+  # tags are not semver, so latest == most recently created: pruning old ones
+  # keeps that unambiguous.
+  prune:
+    needs: build
+    if: needs.build.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Delete old tip-win releases (keep newest 10)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tags=$(gh api repos/${{ github.repository }}/releases \
+                  --paginate -q 'sort_by(.created_at) | reverse | .[].tag_name' \
+                | grep '^tip-win-' || true)
+          count=$(echo "$tags" | grep -c . || true)
+          if [ "${count:-0}" -le 10 ]; then exit 0; fi
+          echo "$tags" | tail -n +11 | while read -r t; do
+            echo "pruning $t"
+            gh release delete "$t" --yes --cleanup-tag || true
+          done

@@ -804,6 +804,14 @@ public partial class App : Application
         // sites inside static scopes.
         Ghostty.Logging.StaticLoggers.Initialize(factory);
 
+        // Portable self-update: sweep the rollback folder left by a swap
+        // that completed on this very launch (no-op otherwise), then kick
+        // off the fire-and-forget check/download/stage pipeline so the next
+        // launch applies it. No-ops outside the portable layout; opt out
+        // with WINTTY_NO_AUTOUPDATE=1. See Ghostty.Services.PortableSelfUpdater.
+        Ghostty.Services.PortableSelfUpdater.SweepOldInstall();
+        Ghostty.Services.PortableSelfUpdater.StartBackgroundCheck();
+
         // App-wide notice queue. Constructed before the NO_COLOR check (its
         // first customer) and before any window, so a startup notice is already
         // in the collection when the first NotificationHost binds.

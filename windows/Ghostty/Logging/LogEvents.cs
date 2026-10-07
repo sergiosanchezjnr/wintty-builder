@@ -130,4 +130,19 @@ internal static class LogEvents
     {
         public const int ReconcileFailed = 3100; // TabHost
     }
+
+    // 3200-3299: Portable self-update (PortableSelfUpdater)
+    internal static class Updater
+    {
+        public const int Failed           = 3200; // any background-pipeline error
+        public const int Timeout          = 3201; // check/download budget exhausted
+        public const int NoAsset          = 3202; // latest release lacks the zip asset
+        public const int UpToDate         = 3203; // running build matches latest
+        public const int Found            = 3204; // newer release available
+        public const int ChecksumMismatch = 3205; // sha256 sidecar disagreed
+        public const int BadPayload       = 3206; // zip had no Wintty.exe at root
+        public const int Staged           = 3207; // update staged, applies on relaunch
+        public const int SwapFailed       = 3208; // rename-swap threw; ran old tree
+        public const int Swapped          = 3209; // swap completed, relaunching
+    }
 }
