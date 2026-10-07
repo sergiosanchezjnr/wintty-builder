@@ -1,0 +1,161 @@
+# Builds the Windows app (Wintty) and packages two shippable artifacts:
+#
+#   1. A portable .zip  - the raw NativeAOT publish folder, ready to unzip
+#      and run Wintty.exe with no install step.
+#   2. An installer .exe - a self-contained Inno Setup installer produced
+#      by `innosetup /iscc` from windows/packaging/wintty.iss. The .iss
+#      harvests the same publish folder, so both artifacts ship identical
+#      bits; only the delivery mechanism differs.
+#
+# Triggers:
+#   - Tag push matching v* or windows-v* -> builds and attaches both
+#     artifacts to the GitHub Release for that tag (draft if it doesn't
+#     exist yet).
+#   - Push to the `windows` branch -> builds and uploads artifacts to the
+#     "windows-tip" prerelease (created on first run), so tip builds are
+#     always downloadable.
+#   - workflow_dispatch -> build and upload as artifacts only (no release).
+#
+# The build legs mirror the proven windows-tests.yml recipe (setup-zig
+# reads .minimum_zig_version from build.zig.zon; setup-dotnet reads the
+# SDK pinned by root global.json; locked restore via RestoreLockedMode)
+# and the release-smoke.ps1 publish recipe (zig ReleaseFast libghostty,
+# then dotnet publish of Ghostty.csproj with PublishAot=true).
+
+name: windows-release
+
+on:
+  push:
+    tags:
+      - 'v*'
+      - 'windows-v*'
+    branches: [windows]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write # soft-creates/updates releases and uploads assets
+
+concurrency:
+  group: windows-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PUBLISH_DIR: ${{ github.workspace }}\publish-out
+  PORTABLE_ZIP: wintty-portable-win-x64.zip
+  INSTALLER_EXE: wintty-setup-win-x64.exe
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # needed to derive a version from tags on branch builds
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+
+      # ghostty.dll must exist before any dotnet build (ErrorIfNoLibghostty
+      # in Ghostty.csproj). ReleaseFast is the only optimization worth
+      # shipping - same leg as just build-dll-release.
+      - name: Build ghostty.dll (ReleaseFast)
+        run: zig build -Dapp-runtime=none -Doptimize=ReleaseFast
+
+      # Version for the installer metadata and artifact names: the tag on
+      # tag pushes, otherwise the short SHA prefixed with the zig-side
+      # version so tip builds remain identifiable.
+      - name: Compute version
+        shell: pwsh
+        run: |
+          $tag = '${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}'
+          if ($tag) {
+            $ver = $tag -replace '^windows-', ''
+          } else {
+            $base = (Select-String -Path build.zig.zon -Pattern '\.version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+            $ver = "$base-$($env:GITHUB_SHA.Substring(0,7))"
+          }
+          "VERSION=$ver" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: NuGet restore (locked)
+        run: dotnet restore windows/Ghostty/Ghostty.sln
+
+      # NativeAOT self-contained publish. Ghostty.csproj already sets
+      # PublishAot + WindowsAppSDKSelfContained and its targets stage the
+      # licenses, resources, and the Windows App SDK Insights dll into the
+      # publish folder - exactly what the MSI harvest and Velopack pack
+      # steps read upstream ($(PublishDir)\**). We redirect that folder so
+      # packaging below has one flat, complete payload.
+      - name: Publish Wintty (NativeAOT, win-x64)
+        run: >-
+          dotnet publish windows/Ghostty/Ghostty.csproj
+          -c Release -r win-x64 /p:Platform=x64 /p:RestoreLockedMode=true
+          /p:PublishDir=${{ env.PUBLISH_DIR }}\\
+
+      - name: Verify publish payload
+        shell: pwsh
+        run: |
+          # Ghostty.csproj stages libghostty under native\ in the output tree.
+          $required = @('Wintty.exe', 'native\ghostty.dll', 'Microsoft.WindowsAppRuntime.Insights.Resource.dll')
+          foreach ($f in $required) {
+            if (-not (Test-Path (Join-Path "${{ env.PUBLISH_DIR }}" $f))) {
+              Write-Error "publish folder is missing $f - refusing to package an incomplete payload"
+              exit 1
+            }
+          }
+
+      # Portable artifact: the publish folder as-is. Users unzip anywhere
+      # and run Wintty.exe; no runtime or admin required (self-contained).
+      - name: Build portable zip
+        shell: pwsh
+        run: Compress-Archive -Path "${{ env.PUBLISH_DIR }}\*" -DestinationPath "${{ env.PORTABLE_ZIP }}"
+
+      # Installer artifact: Inno Setup compiles windows/packaging/wintty.iss
+      # against the same publish folder. ISCC is preinstalled on the GitHub
+      # windows runner image.
+      - name: Build installer exe
+        shell: pwsh
+        run: |
+          $isscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path $isscc)) {
+            # Fallback for images without the preinstall.
+            choco install innosetup --yes --no-progress
+            $isscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
+          }
+          & $isscc "/DPublishDir=${{ env.PUBLISH_DIR }}" "/DAppVersion=$env:VERSION" "/DOutputDir=${{ github.workspace }}" windows/packaging/wintty.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $built = Get-ChildItem -Filter 'wintty-setup-*.exe' | Select-Object -First 1
+          if (-not $built) { Write-Error 'ISCC reported success but produced no installer'; exit 1 }
+          Move-Item -Force $built.FullName "${{ env.INSTALLER_EXE }}"
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: wintty-windows-x64-${{ github.sha }}
+          path: |
+            ${{ env.PORTABLE_ZIP }}
+            ${{ env.INSTALLER_EXE }}
+          if-no-files-found: error
+
+      # Branch builds land on a rolling prerelease so tip is always
+      # downloadable; tag builds attach to the release for that tag
+      # (soft-created if the release pipeline hasn't made it yet).
+      - name: Resolve target release
+        id: rel
+        shell: pwsh
+        run: |
+          $tag = '${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && github.ref_name || 'windows-tip' }}'
+          "tag=$tag" | Out-File $env:GITHUB_OUTPUT -Append
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        if: github.event_name != 'workflow_dispatch'
+        with:
+          tag_name: ${{ steps.rel.outputs.tag }}
+          name: Wintty ${{ steps.rel.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          prerelease: ${{ steps.rel.outputs.tag == 'windows-tip' }}
+          files: |
+            ${{ env.PORTABLE_ZIP }}
+            ${{ env.INSTALLER_EXE }}
