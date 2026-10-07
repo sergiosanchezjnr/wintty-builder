@@ -169,6 +169,75 @@ internal static partial class StaticLoggers
     }
 }
 
+/// <summary>
+/// Portable self-update records (Ghostty.Services.PortableSelfUpdater),
+/// routed through the App category because the updater is a static
+/// background pipeline with no ctor to inject into and its failures are
+/// launch-adjacent events that belong beside the other startup records.
+/// </summary>
+internal static partial class UpdaterLogExtensions
+{
+    [LoggerMessage(EventId = Ghostty.Logging.LogEvents.Updater.Failed,
+                   Level = LogLevel.Warning,
+                   Message = "Portable self-update failed")]
+    internal static partial void LogUpdaterFailed(
+        this ILogger<App> logger, System.Exception ex);
+
+    [LoggerMessage(EventId = Ghostty.Logging.LogEvents.Updater.Timeout,
+                   Level = LogLevel.Warning,
+                   Message = "Portable self-update timed out")]
+    internal static partial void LogUpdaterTimeout(
+        this ILogger<App> logger);
+
+    [LoggerMessage(EventId = Ghostty.Logging.LogEvents.Updater.NoAsset,
+                   Level = LogLevel.Warning,
+                   Message = "Latest release {Tag} has no portable zip asset")]
+    internal static partial void LogUpdaterNoAsset(
+        this ILogger<App> logger, string Tag);
+
+    [LoggerMessage(EventId = Ghostty.Logging.LogEvents.Updater.UpToDate,
+                   Level = LogLevel.Debug,
+                   Message = "Already up to date: commit {Commit}, latest release {Tag} (prerelease: {Prerelease})")]
+    internal static partial void LogUpdaterUpToDate(
+        this ILogger<App> logger, string Commit, string Tag, bool Prerelease);
+
+    [LoggerMessage(EventId = Ghostty.Logging.LogEvents.Updater.Found,
+                   Level = LogLevel.Information,
+                   Message = "Newer build available: {Tag} (running {Commit})")]
+    internal static partial void LogUpdaterFound(
+        this ILogger<App> logger, string Commit, string Tag);
+
+    [LoggerMessage(EventId = Ghostty.Logging.LogEvents.Updater.ChecksumMismatch,
+                   Level = LogLevel.Warning,
+                   Message = "Update download rejected: sha256 mismatch (expected {Expected}, got {Actual})")]
+    internal static partial void LogUpdaterChecksumMismatch(
+        this ILogger<App> logger, string Expected, string Actual);
+
+    [LoggerMessage(EventId = Ghostty.Logging.LogEvents.Updater.BadPayload,
+                   Level = LogLevel.Warning,
+                   Message = "Update payload for {Tag} contains no Wintty.exe; discarded")]
+    internal static partial void LogUpdaterBadPayload(
+        this ILogger<App> logger, string Tag);
+
+    [LoggerMessage(EventId = Ghostty.Logging.LogEvents.Updater.Staged,
+                   Level = LogLevel.Information,
+                   Message = "Update {Tag} staged; applies on next launch")]
+    internal static partial void LogUpdaterStaged(
+        this ILogger<App> logger, string Tag);
+
+    [LoggerMessage(EventId = Ghostty.Logging.LogEvents.Updater.SwapFailed,
+                   Level = LogLevel.Warning,
+                   Message = "Pending update swap failed; running current files, will retry next launch")]
+    internal static partial void LogUpdaterSwapFailed(
+        this ILogger<App> logger, System.Exception ex);
+
+    [LoggerMessage(EventId = Ghostty.Logging.LogEvents.Updater.Swapped,
+                   Level = LogLevel.Information,
+                   Message = "Applied update {Tag}; relaunching")]
+    internal static partial void LogUpdaterSwapped(
+        this ILogger<App> logger, string Tag);
+}
+
 internal static partial class CheatSheetLogExtensions
 {
     [LoggerMessage(EventId = Ghostty.Logging.LogEvents.SettingsUi.CheatSheetShowFailed,

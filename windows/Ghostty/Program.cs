@@ -852,6 +852,15 @@ public static partial class Program
 
     static int MainImpl(string[] args)
     {
+        // A staged portable self-update swaps the install tree over before
+        // any Wintty binary is memory-mapped: once ghostty.dll or an .ni.dll
+        // beside us is loaded, its files cannot be renamed. Returns an exit
+        // code only when a swap happened and the new exe was relaunched;
+        // null (the normal case) means nothing pending, continue startup.
+        if (Ghostty.Services.PortableSelfUpdater.ApplyPendingUpdateIfMarked(args)
+            is int relaunchExitCode)
+            return relaunchExitCode;
+
         // Resolve `ghostty` to native/ghostty.dll for every entry path,
         // before anything can P/Invoke into it. This is deliberately the
         // only registration in the process: SetDllImportResolver throws
