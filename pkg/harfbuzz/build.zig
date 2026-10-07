@@ -188,8 +188,24 @@ const HarfBuzzC = struct {
         });
         // Disable ubsan for MSVC: Zig's ubsan runtime cannot be bundled
         // on Windows (LNK4229), leaving __ubsan_handle_* unresolved when
-        // the static archive is consumed by an external linker.
-        if (self.options.target.result.abi == .msvc) {
+        // the static archive is consumed by an external linker. But these
+        // flags are clang-only: unknown to MSVC cl.exe, and fatal when they
+        // leak into translate-c, whose -MD dependency scan probes every
+        // argument against the real compiler and aborts the build ("failed
+        // command") on unknown options. So only add them when the C compiler
+        // actually used for this target is clang-compatible: an explicit CC
+        // wins; otherwise zig's own probe logic applies — it prefers clang
+        // unless something like VCPKG_ROOT forces cl.exe as the detected
+        // MSVC toolchain.
+        const msvc_cc_is_clang = blk: {
+            if (std.os.getenv("CC")) |cc| break :blk std.mem.indexOf(
+                u8,
+                std.fs.path.basename(cc),
+                "clang",
+            ) != null;
+            break :blk std.os.getenv("VCPKG_ROOT") == null;
+        };
+        if (self.options.target.result.abi == .msvc and msvc_cc_is_clang) {
             try flag_builder.appendSlice(self.builder.allocator, &.{
                 "-fno-sanitize=undefined",
                 "-fno-sanitize-trap=undefined",
